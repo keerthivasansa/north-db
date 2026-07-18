@@ -15,15 +15,15 @@ Implemented today:
 - 8 KiB raw page abstraction
 - Fixed-width page IDs and row identifiers
 - Variable-length slotted heap pages
+- Database-file header and exact page I/O
 
 Planned next:
 
-1. Disk page manager and database-file header
-2. Buffer pool
-3. Table catalog and immutable row layouts
-4. B+ tree primary and secondary indexes
-5. North Query Language parser and executor
-6. Write-ahead log and recovery
+1. Buffer pool
+2. Table catalog and immutable row layouts
+3. B+ tree primary and secondary indexes
+4. North Query Language parser and executor
+5. Write-ahead log and recovery
 
 ## Global storage invariants
 
@@ -50,6 +50,39 @@ n × 8192
 The page layer performs checked reads and writes and explicitly encodes integer
 values in little-endian order. It does not expose unchecked access or use
 `unsafe` Rust.
+
+## Database file and disk manager
+
+Page zero is reserved for database-wide metadata. It is not a heap or index
+page. `DiskManager` is the only current component that reads or writes the
+database file; it performs full-page I/O and rejects reads or writes to page
+zero and unallocated page IDs.
+
+### Database header
+
+The header occupies all of page zero. Bytes not assigned below are currently
+zero and reserved for future compatibility.
+
+| Offset | Size | Field | Meaning |
+| ---: | ---: | --- | --- |
+| 0 | 8 | magic | ASCII `NORTHDB\\0` |
+| 8 | 2 | format version | Currently `1` |
+| 10 | 2 | reserved | Zero |
+| 12 | 4 | page size | `8192` |
+| 16 | 4 | next page ID | First never-allocated data page ID |
+| 20 | 4 | catalog root page ID | Reserved; `u32::MAX` means none |
+| 24 | 4 | flags | Reserved, currently zero |
+| 28 | 4 | checksum | Reserved, currently zero |
+
+A new database has only its header page and `next_page_id = 1`. Allocating a
+page writes a zeroed 8 KiB page at the high-water mark and then advances the
+stored `next_page_id`. `DiskManager::sync` explicitly requests durable file
+storage. Crash-safe allocation ordering and header checksums will arrive with
+the write-ahead log.
+
+Opening a file validates its page alignment, header magic/version/page size, and
+that the allocation high-water mark does not point beyond the physical file.
+Existing files are never overwritten by database creation.
 
 ## RID encoding
 
