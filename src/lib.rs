@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod heap;
+pub mod schema;
 pub mod storage;
 
 pub use config::Config;

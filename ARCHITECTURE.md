@@ -17,13 +17,17 @@ Implemented today:
 - Variable-length slotted heap pages
 - Database-file header and exact page I/O
 - Bounded buffer pool with pinned page guards and dirty writeback
+- Immutable schemas and canonical row encoding
 
 Planned next:
 
-1. Table catalog and immutable row layouts
+1. Persistent table catalog and multi-page heap files
 2. B+ tree primary and secondary indexes
-3. North Query Language parser and executor
-4. Write-ahead log and recovery
+3. Ordered execution engine
+4. North Query Language parser and type checker
+
+Write-ahead logging and crash recovery are deliberately deferred until the core
+queryable database path is complete.
 
 ## Global storage invariants
 
@@ -124,6 +128,85 @@ commit operation.
 Cache hit, miss, eviction, and disk-write counters are exposed for tests and
 future performance diagnostics. The configured cache budget will be converted
 to a page capacity when the database bootstrap layer is added.
+
+## Immutable schemas
+
+A `TableSchema` owns a table name, its ordered columns, the primary-key column
+index, and a compiled `RowLayout`. There are no schema mutation APIs. Every
+schema must satisfy these invariants:
+
+- It contains at least one column.
+- Table and column names are ASCII identifiers.
+- Column names are unique within the table.
+- Exactly one column is the primary key.
+- The primary key is not nullable.
+- Its minimum encoded row fits into one empty heap page.
+
+The MVP value types are:
+
+| North type | Row representation |
+| --- | --- |
+| `int` | Signed 64-bit little-endian integer |
+| `float` | IEEE 754 64-bit little-endian value |
+| `bool` | One canonical byte: `0` or `1` |
+| `text` | UTF-8 payload with offset/length descriptor |
+| `bytes` | Arbitrary payload with offset/length descriptor |
+
+Nullable columns are represented by a bitmap. `null` has no variable payload
+and its fixed slot must contain only zero bytes.
+
+### Schema encoding
+
+Catalog storage will persist schema declarations using this stable encoding:
+
+```text
+magic               4 bytes   "NSCH"
+format version      2 bytes   currently 1
+column count        2 bytes
+table name          u16 length + UTF-8 bytes
+columns[]:
+  column name       u16 length + UTF-8 bytes
+  type tag          1 byte
+  flags             1 byte    nullable / primary key
+```
+
+Compiled offsets are not serialized. North validates the declaration and
+recomputes `RowLayout` whenever a schema is loaded, preventing persisted derived
+metadata from becoming authoritative.
+
+## Row encoding
+
+Rows have a canonical, schema-dependent layout:
+
+```text
++--------------------+ offset 0
+| format version     | 1 byte
++--------------------+
+| null bitmap        | ceil(column_count / 8)
++--------------------+
+| fixed column slots | offsets precomputed once per schema
++--------------------+
+| variable payloads  | text and bytes, in column order
++--------------------+
+```
+
+Fixed slots consume 8 bytes for `int` and `float`, 1 byte for `bool`, and 8
+bytes for a variable-value descriptor. Each descriptor is:
+
+```text
+row-relative payload offset  u32, little-endian
+payload length               u32, little-endian
+```
+
+Variable payloads must be contiguous and appear in column order. Trailing,
+overlapping, out-of-order, invalid UTF-8, noncanonical boolean, and invalid null
+encodings are rejected as corruption.
+
+Decoding returns borrowed `text` and `bytes` views into the row buffer. Projected
+decoding returns only requested columns, while the compiled layout provides
+their fixed offsets without scanning preceding values. The maximum encoded row
+is the payload capacity of one otherwise-empty heap page; overflow rows are not
+part of the MVP.
 
 ## RID encoding
 
@@ -237,6 +320,8 @@ on-disk layout.
 | Module | Responsibility |
 | --- | --- |
 | `config` | Strict YAML configuration and validation |
+| `schema::table` | Immutable schema validation and schema serialization |
+| `schema::row` | Compiled layouts and canonical row encoding/decoding |
 | `storage::buffer_pool` | Bounded page cache, guards, LRU eviction, and writeback |
 | `storage::page` | Fixed-size raw pages and checked byte access |
 | `storage::rid` | Stable RID encoding |
