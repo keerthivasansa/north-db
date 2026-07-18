@@ -1,0 +1,19 @@
+[package]
+name = "north-db"
+version = "0.1.0"
+edition = "2021"
+description = "A small ordered database engine"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "north_db"
+path = "src/lib.rs"
+
+[[bin]]
+name = "north"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = { version = "0.0.29", default-features = false, features = ["deserialize"] }
+

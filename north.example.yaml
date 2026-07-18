@@ -1,0 +1,15 @@
+version: 1
+
+storage:
+  path: "./data.north"
+  cache_size_mb: 64
+  create_if_missing: true
+  read_only: false
+
+durability:
+  sync_on_commit: true
+  page_checksums: true
+
+logging:
+  level: "info"
+
