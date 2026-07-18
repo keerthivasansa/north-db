@@ -23,6 +23,7 @@ catalog, B+ tree, query language, and crash recovery are in progress.
 - Stable `(PageId, SlotId, Generation)` row identifiers
 - Variable-length slotted heap pages
 - Insert, lookup, delete, slot reuse, and compaction
+- Bounded LRU page cache with pinned guards and dirty writeback
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the on-disk layout, invariants, and
 implementation roadmap.

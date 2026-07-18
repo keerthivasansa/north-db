@@ -16,14 +16,14 @@ Implemented today:
 - Fixed-width page IDs and row identifiers
 - Variable-length slotted heap pages
 - Database-file header and exact page I/O
+- Bounded buffer pool with pinned page guards and dirty writeback
 
 Planned next:
 
-1. Buffer pool
-2. Table catalog and immutable row layouts
-3. B+ tree primary and secondary indexes
-4. North Query Language parser and executor
-5. Write-ahead log and recovery
+1. Table catalog and immutable row layouts
+2. B+ tree primary and secondary indexes
+3. North Query Language parser and executor
+4. Write-ahead log and recovery
 
 ## Global storage invariants
 
@@ -83,6 +83,47 @@ the write-ahead log.
 Opening a file validates its page alignment, header magic/version/page size, and
 that the allocation high-water mark does not point beyond the physical file.
 Existing files are never overwritten by database creation.
+
+## Buffer pool
+
+`BufferPool` owns the disk manager and a fixed number of in-memory frames. A
+frame contains one page, its pin count, its last-access clock value, and whether
+mutable access is allowed.
+
+```text
+caller
+  | pin(page_id)
+  v
+PageGuard ──────> cached Frame ──────> Page
+                     |
+                     +── dirty eviction/flush ──> DiskManager
+```
+
+The current implementation is deliberately single-threaded. It uses checked
+interior mutability to support multiple simultaneous guards without `unsafe`
+Rust. Multiple immutable page borrows may coexist; a mutable page borrow is
+exclusive and is rejected for a read-only database.
+
+### Pin and eviction invariants
+
+1. Creating a guard increments the frame's pin count; dropping it decrements the
+   count.
+2. A frame with a nonzero pin count cannot be evicted.
+3. At capacity, the least recently used unpinned frame is selected.
+4. A dirty victim is fully written before it is removed from the cache.
+5. If every frame is pinned, the request fails with `AllFramesPinned`; capacity
+   is never exceeded.
+6. Cache misses read through the disk manager. New disk pages enter the cache
+   already pinned.
+
+`flush_all` writes dirty pages to the database file. `sync` additionally asks the
+operating system to make those writes durable. `close` performs both operations
+and returns the disk manager. Dropping a buffer pool by itself is not a durable
+commit operation.
+
+Cache hit, miss, eviction, and disk-write counters are exposed for tests and
+future performance diagnostics. The configured cache budget will be converted
+to a page capacity when the database bootstrap layer is added.
 
 ## RID encoding
 
@@ -196,6 +237,7 @@ on-disk layout.
 | Module | Responsibility |
 | --- | --- |
 | `config` | Strict YAML configuration and validation |
+| `storage::buffer_pool` | Bounded page cache, guards, LRU eviction, and writeback |
 | `storage::page` | Fixed-size raw pages and checked byte access |
 | `storage::rid` | Stable RID encoding |
 | `heap::slotted_page` | Heap-page format, row lifecycle, and validation |
