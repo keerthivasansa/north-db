@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod catalog;
 pub mod config;
 pub mod heap;
 pub mod schema;

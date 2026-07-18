@@ -105,6 +105,17 @@ impl DiskManager {
         self.read_only
     }
 
+    /// Sets the catalog root exactly once and persists it in page zero.
+    pub fn set_catalog_root_page_id(&mut self, page_id: PageId) -> Result<(), DiskManagerError> {
+        self.ensure_writable()?;
+        self.ensure_allocated_data_page(page_id)?;
+        if let Some(existing) = self.header.catalog_root_page_id {
+            return Err(DiskManagerError::CatalogRootAlreadySet(existing));
+        }
+        self.header.catalog_root_page_id = Some(page_id);
+        self.persist_header()
+    }
+
     /// Appends one zeroed page, persists the new allocation high-water mark,
     /// and returns the newly allocated page.
     pub fn allocate_page(&mut self) -> Result<Page, DiskManagerError> {
@@ -359,6 +370,7 @@ pub enum DiskManagerError {
     HeaderPageIsReserved,
     PageNotAllocated(PageId),
     PageIdExhausted,
+    CatalogRootAlreadySet(PageId),
 }
 
 impl fmt::Display for DiskManagerError {
@@ -382,6 +394,11 @@ impl fmt::Display for DiskManagerError {
                 page_id.get()
             ),
             Self::PageIdExhausted => write!(formatter, "database has exhausted allocatable page IDs"),
+            Self::CatalogRootAlreadySet(page_id) => write!(
+                formatter,
+                "database catalog root is already page {}",
+                page_id.get()
+            ),
         }
     }
 }
@@ -521,5 +538,22 @@ mod tests {
             Err(DiskManagerError::Io { .. })
         ));
         assert_eq!(fs::read(path.as_ref()).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn persists_catalog_root_exactly_once() {
+        let path = TestDatabasePath::new();
+        let mut manager = DiskManager::create(&path).unwrap();
+        let root = manager.allocate_page().unwrap().id();
+        manager.set_catalog_root_page_id(root).unwrap();
+        assert!(matches!(
+            manager.set_catalog_root_page_id(root),
+            Err(DiskManagerError::CatalogRootAlreadySet(existing)) if existing == root
+        ));
+        manager.sync().unwrap();
+        drop(manager);
+
+        let reopened = DiskManager::open(&path).unwrap();
+        assert_eq!(reopened.header().catalog_root_page_id(), Some(root));
     }
 }

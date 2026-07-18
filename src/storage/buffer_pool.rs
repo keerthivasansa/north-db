@@ -5,7 +5,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use super::{DiskManager, DiskManagerError, Page, PageId};
+use super::{DatabaseHeader, DiskManager, DiskManagerError, Page, PageId};
 
 /// Observable counters for buffer-pool behavior.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -173,6 +173,17 @@ impl BufferPool {
 
     pub fn stats(&self) -> BufferPoolStats {
         self.inner.borrow().stats
+    }
+
+    pub fn database_header(&self) -> DatabaseHeader {
+        self.inner.borrow().disk.header()
+    }
+
+    pub fn set_catalog_root_page_id(&self, page_id: PageId) -> Result<(), BufferPoolError> {
+        self.borrow_inner_mut()?
+            .disk
+            .set_catalog_root_page_id(page_id)?;
+        Ok(())
     }
 
     fn borrow_inner_mut(&self) -> Result<RefMut<'_, BufferPoolInner>, BufferPoolError> {

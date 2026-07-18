@@ -30,56 +30,75 @@ const SLOT_FLAGS: usize = 6;
 const SLOT_LIVE: u16 = 1;
 const SLOT_RETIRED: u16 = 2;
 
-/// An owned 8 KiB heap page with a slot directory growing from the front and
-/// row data growing from the back.
-pub struct SlottedPage {
-    page: Page,
+/// A validated 8 KiB heap page with a slot directory growing from the front and
+/// row data growing from the back. It may own its page or borrow one from the
+/// buffer pool.
+pub struct SlottedPage<'page> {
+    backing: PageBacking<'page>,
 }
 
-impl SlottedPage {
+enum PageBacking<'page> {
+    Owned(Page),
+    Borrowed(&'page mut Page),
+    Shared(&'page Page),
+}
+
+impl SlottedPage<'static> {
     pub fn new(id: PageId) -> Self {
         let mut page = Page::zeroed(id);
-        page.write(MAGIC_OFFSET, MAGIC)
-            .expect("heap-page magic is in bounds");
-        page.write(VERSION_OFFSET, &[FORMAT_VERSION])
-            .expect("heap-page version is in bounds");
-        page.write(PAGE_KIND_OFFSET, &[HEAP_PAGE_KIND])
-            .expect("heap-page kind is in bounds");
-        page.write_u16(FLAGS_OFFSET, 0)
-            .expect("heap-page flags are in bounds");
-        page.write_u16(SLOT_COUNT_OFFSET, 0)
-            .expect("heap-page slot count is in bounds");
-        page.write_u16(FREE_START_OFFSET, PAGE_HEADER_SIZE as u16)
-            .expect("heap-page free start is in bounds");
-        page.write_u16(FREE_END_OFFSET, PAGE_SIZE as u16)
-            .expect("heap-page free end is in bounds");
-        page.write_u16(LIVE_COUNT_OFFSET, 0)
-            .expect("heap-page live count is in bounds");
-        page.write_u32(NEXT_PAGE_ID_OFFSET, INVALID_PAGE_ID)
-            .expect("heap-page link is in bounds");
-        page.write(PAGE_LSN_OFFSET, &[0; 8])
-            .expect("heap-page LSN is in bounds");
-        page.write_u32(CHECKSUM_OFFSET, 0)
-            .expect("heap-page checksum is in bounds");
-        Self { page }
+        initialize_page(&mut page);
+        Self {
+            backing: PageBacking::Owned(page),
+        }
     }
 
     pub fn from_page(page: Page) -> Result<Self, SlottedPageError> {
-        let slotted = Self { page };
+        let slotted = Self {
+            backing: PageBacking::Owned(page),
+        };
         slotted.validate()?;
         Ok(slotted)
     }
 
     pub fn into_page(self) -> Page {
-        self.page
+        match self.backing {
+            PageBacking::Owned(page) => page,
+            PageBacking::Borrowed(_) => unreachable!("static slotted page cannot borrow"),
+            PageBacking::Shared(_) => unreachable!("static slotted page cannot borrow"),
+        }
+    }
+}
+
+impl<'page> SlottedPage<'page> {
+    pub fn initialize(page: &'page mut Page) -> Self {
+        initialize_page(page);
+        Self {
+            backing: PageBacking::Borrowed(page),
+        }
+    }
+
+    pub fn from_page_mut(page: &'page mut Page) -> Result<Self, SlottedPageError> {
+        let slotted = Self {
+            backing: PageBacking::Borrowed(page),
+        };
+        slotted.validate()?;
+        Ok(slotted)
+    }
+
+    pub fn from_page_ref(page: &'page Page) -> Result<Self, SlottedPageError> {
+        let slotted = Self {
+            backing: PageBacking::Shared(page),
+        };
+        slotted.validate()?;
+        Ok(slotted)
     }
 
     pub fn page(&self) -> &Page {
-        &self.page
+        self.page_ref()
     }
 
     pub fn page_id(&self) -> PageId {
-        self.page.id()
+        self.page_ref().id()
     }
 
     pub fn slot_count(&self) -> u16 {
@@ -96,17 +115,16 @@ impl SlottedPage {
 
     pub fn next_page_id(&self) -> Option<PageId> {
         let raw = self
-            .page
+            .page_ref()
             .read_u32(NEXT_PAGE_ID_OFFSET)
             .expect("validated heap-page link is readable");
         (raw != INVALID_PAGE_ID).then(|| PageId::new(raw))
     }
 
-    pub fn set_next_page_id(&mut self, next: Option<PageId>) {
+    pub fn set_next_page_id(&mut self, next: Option<PageId>) -> Result<(), SlottedPageError> {
         let raw = next.map_or(INVALID_PAGE_ID, PageId::get);
-        self.page
-            .write_u32(NEXT_PAGE_ID_OFFSET, raw)
-            .expect("heap-page link is in bounds");
+        self.page_mut()?.write_u32(NEXT_PAGE_ID_OFFSET, raw)?;
+        Ok(())
     }
 
     pub fn insert(&mut self, record: &[u8]) -> Result<Rid, SlottedPageError> {
@@ -142,7 +160,7 @@ impl SlottedPage {
         };
 
         let record_offset = self.free_end() - record.len();
-        self.page.write(record_offset, record)?;
+        self.page_mut()?.write(record_offset, record)?;
         self.write_slot_u16(slot_id, SLOT_RECORD_OFFSET, record_offset as u16)?;
         self.write_slot_u16(slot_id, SLOT_RECORD_LENGTH, record_length)?;
         self.write_slot_u16(slot_id, SLOT_GENERATION, generation)?;
@@ -175,7 +193,15 @@ impl SlottedPage {
         self.validate_rid(rid)?;
         let offset = usize::from(self.slot_u16(rid.slot_id(), SLOT_RECORD_OFFSET));
         let length = usize::from(self.slot_u16(rid.slot_id(), SLOT_RECORD_LENGTH));
-        Ok(self.page.read(offset, length)?)
+        Ok(self.page_ref().read(offset, length)?)
+    }
+
+    pub fn live_rids(&self) -> Vec<Rid> {
+        (0..self.slot_count())
+            .map(SlotId::new)
+            .filter(|slot| self.slot_u16(*slot, SLOT_FLAGS) == SLOT_LIVE)
+            .map(|slot| Rid::new(self.page_id(), slot, self.slot_u16(slot, SLOT_GENERATION)))
+            .collect()
     }
 
     pub fn delete(&mut self, rid: Rid) -> Result<(), SlottedPageError> {
@@ -219,7 +245,7 @@ impl SlottedPage {
             target_end = target_end
                 .checked_sub(length)
                 .ok_or(SlottedPageError::Corrupt("live records exceed page size"))?;
-            let record = self.page.read(old_offset, length)?;
+            let record = self.page_ref().read(old_offset, length)?;
             packed[target_end..target_end + length].copy_from_slice(record);
             new_offsets.push((slot, target_end as u16));
         }
@@ -230,7 +256,7 @@ impl SlottedPage {
             ));
         }
 
-        self.page.write(free_start, &packed[free_start..])?;
+        self.page_mut()?.write(free_start, &packed[free_start..])?;
         for (slot, offset) in new_offsets {
             self.write_slot_u16(slot, SLOT_RECORD_OFFSET, offset)?;
         }
@@ -239,13 +265,13 @@ impl SlottedPage {
     }
 
     fn validate(&self) -> Result<(), SlottedPageError> {
-        if self.page.read(MAGIC_OFFSET, MAGIC.len())? != MAGIC {
+        if self.page_ref().read(MAGIC_OFFSET, MAGIC.len())? != MAGIC {
             return Err(SlottedPageError::Corrupt("invalid heap-page magic"));
         }
-        if self.page.read(VERSION_OFFSET, 1)?[0] != FORMAT_VERSION {
+        if self.page_ref().read(VERSION_OFFSET, 1)?[0] != FORMAT_VERSION {
             return Err(SlottedPageError::Corrupt("unsupported heap-page version"));
         }
-        if self.page.read(PAGE_KIND_OFFSET, 1)?[0] != HEAP_PAGE_KIND {
+        if self.page_ref().read(PAGE_KIND_OFFSET, 1)?[0] != HEAP_PAGE_KIND {
             return Err(SlottedPageError::Corrupt("page is not a heap page"));
         }
 
@@ -363,13 +389,13 @@ impl SlottedPage {
     }
 
     fn header_u16(&self, offset: usize) -> u16 {
-        self.page
+        self.page_ref()
             .read_u16(offset)
             .expect("validated heap-page header is readable")
     }
 
     fn write_header_u16(&mut self, offset: usize, value: u16) -> Result<(), SlottedPageError> {
-        self.page.write_u16(offset, value)?;
+        self.page_mut()?.write_u16(offset, value)?;
         Ok(())
     }
 
@@ -378,7 +404,7 @@ impl SlottedPage {
     }
 
     fn slot_u16(&self, slot: SlotId, field_offset: usize) -> u16 {
-        self.page
+        self.page_ref()
             .read_u16(self.slot_offset(slot) + field_offset)
             .expect("validated slot entry is readable")
     }
@@ -389,10 +415,53 @@ impl SlottedPage {
         field_offset: usize,
         value: u16,
     ) -> Result<(), SlottedPageError> {
-        self.page
-            .write_u16(self.slot_offset(slot) + field_offset, value)?;
+        let offset = self.slot_offset(slot) + field_offset;
+        self.page_mut()?.write_u16(offset, value)?;
         Ok(())
     }
+
+    fn page_ref(&self) -> &Page {
+        match &self.backing {
+            PageBacking::Owned(page) => page,
+            PageBacking::Borrowed(page) => page,
+            PageBacking::Shared(page) => page,
+        }
+    }
+
+    fn page_mut(&mut self) -> Result<&mut Page, SlottedPageError> {
+        match &mut self.backing {
+            PageBacking::Owned(page) => Ok(page),
+            PageBacking::Borrowed(page) => Ok(page),
+            PageBacking::Shared(_) => Err(SlottedPageError::ReadOnly),
+        }
+    }
+}
+
+fn initialize_page(page: &mut Page) {
+    page.write(0, &[0; PAGE_SIZE])
+        .expect("heap page is exactly PAGE_SIZE bytes");
+    page.write(MAGIC_OFFSET, MAGIC)
+        .expect("heap-page magic is in bounds");
+    page.write(VERSION_OFFSET, &[FORMAT_VERSION])
+        .expect("heap-page version is in bounds");
+    page.write(PAGE_KIND_OFFSET, &[HEAP_PAGE_KIND])
+        .expect("heap-page kind is in bounds");
+    page.write_u16(FLAGS_OFFSET, 0)
+        .expect("heap-page flags are in bounds");
+    page.write_u16(SLOT_COUNT_OFFSET, 0)
+        .expect("heap-page slot count is in bounds");
+    page.write_u16(FREE_START_OFFSET, PAGE_HEADER_SIZE as u16)
+        .expect("heap-page free start is in bounds");
+    page.write_u16(FREE_END_OFFSET, PAGE_SIZE as u16)
+        .expect("heap-page free end is in bounds");
+    page.write_u16(LIVE_COUNT_OFFSET, 0)
+        .expect("heap-page live count is in bounds");
+    page.write_u32(NEXT_PAGE_ID_OFFSET, INVALID_PAGE_ID)
+        .expect("heap-page link is in bounds");
+    page.write(PAGE_LSN_OFFSET, &[0; 8])
+        .expect("heap-page LSN is in bounds");
+    page.write_u32(CHECKSUM_OFFSET, 0)
+        .expect("heap-page checksum is in bounds");
 }
 
 #[derive(Debug)]
@@ -402,6 +471,7 @@ pub enum SlottedPageError {
     RecordTooLarge { size: usize },
     NoSpace { required: usize, available: usize },
     InvalidRid(Rid),
+    ReadOnly,
 }
 
 impl fmt::Display for SlottedPageError {
@@ -423,6 +493,7 @@ impl fmt::Display for SlottedPageError {
                 "heap page has insufficient space: {required} bytes required, {available} available"
             ),
             Self::InvalidRid(rid) => write!(formatter, "RID does not identify a live row: {rid:?}"),
+            Self::ReadOnly => write!(formatter, "heap page was borrowed read-only"),
         }
     }
 }
@@ -545,9 +616,9 @@ mod tests {
     #[test]
     fn stores_heap_page_link() {
         let mut page = SlottedPage::new(PageId::new(16));
-        page.set_next_page_id(Some(PageId::new(17)));
+        page.set_next_page_id(Some(PageId::new(17))).unwrap();
         assert_eq!(page.next_page_id(), Some(PageId::new(17)));
-        page.set_next_page_id(None);
+        page.set_next_page_id(None).unwrap();
         assert_eq!(page.next_page_id(), None);
     }
 
@@ -562,5 +633,19 @@ mod tests {
         page.delete(exhausted).unwrap();
         let next = page.insert(b"different slot").unwrap();
         assert_ne!(next.slot_id(), exhausted.slot_id());
+    }
+
+    #[test]
+    fn shared_page_view_supports_reads_but_rejects_writes() {
+        let mut owned = SlottedPage::new(PageId::new(19));
+        let rid = owned.insert(b"shared").unwrap();
+        let raw = owned.into_page();
+        let mut shared = SlottedPage::from_page_ref(&raw).unwrap();
+
+        assert_eq!(shared.get(rid).unwrap(), b"shared");
+        assert!(matches!(
+            shared.insert(b"rejected"),
+            Err(SlottedPageError::ReadOnly)
+        ));
     }
 }

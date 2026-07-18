@@ -25,6 +25,7 @@ catalog, B+ tree, query language, and crash recovery are in progress.
 - Insert, lookup, delete, slot reuse, and compaction
 - Bounded LRU page cache with pinned guards and dirty writeback
 - Immutable table schemas and compiled, projection-friendly row layouts
+- Persistent table catalog and linked multi-page heap files
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the on-disk layout, invariants, and
 implementation roadmap.

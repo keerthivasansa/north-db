@@ -18,13 +18,13 @@ Implemented today:
 - Database-file header and exact page I/O
 - Bounded buffer pool with pinned page guards and dirty writeback
 - Immutable schemas and canonical row encoding
+- Persistent immutable table catalog and multi-page heap files
 
 Planned next:
 
-1. Persistent table catalog and multi-page heap files
-2. B+ tree primary and secondary indexes
-3. Ordered execution engine
-4. North Query Language parser and type checker
+1. B+ tree primary and secondary indexes
+2. Ordered execution engine
+3. North Query Language parser and type checker
 
 Write-ahead logging and crash recovery are deliberately deferred until the core
 queryable database path is complete.
@@ -208,6 +208,53 @@ their fixed offsets without scanning preceding values. The maximum encoded row
 is the payload capacity of one otherwise-empty heap page; overflow rows are not
 part of the MVP.
 
+## Multi-page heap files
+
+A `HeapFile` is an ordered chain of slotted pages. Its stable identity is the
+first page ID; every page header links to the next page, and the final page uses
+the existing `u32::MAX` sentinel.
+
+```text
+first page             page                 last page
++-----------+         +-----------+         +-----------+
+| rows      | ──────> | rows      | ──────> | rows      |
+| next = 8  |         | next = 13 |         | next = ∅  |
++-----------+         +-----------+         +-----------+
+```
+
+Opening a heap walks and validates the complete chain, rejecting cycles or
+invalid page references. The in-memory heap handle records its member page IDs,
+which prevents a RID from one table being used against another table's heap.
+
+Insert scans existing pages in chain order so deleted space can be reused. If
+no page can fit the record, North initializes a new slotted page and links it at
+the tail. This scan is intentionally simple for the MVP; a free-space map can
+replace it later without changing the heap format. Get and delete use stable
+RIDs, while scan returns rows in page and slot order.
+
+## Persistent catalog
+
+The database header's catalog-root field points to a dedicated catalog heap.
+Each row in that heap is one immutable table declaration:
+
+| Offset | Size | Field | Meaning |
+| ---: | ---: | --- | --- |
+| 0 | 4 | magic | ASCII `NTBL` |
+| 4 | 2 | record version | Currently `1` |
+| 6 | 2 | reserved | Must be zero |
+| 8 | 4 | table ID | Monotonically assigned from `1` |
+| 12 | 4 | heap root page ID | First page of the table heap |
+| 16 | 4 | schema length | Encoded schema byte count |
+| 20 | variable | schema | `NSCH` schema declaration |
+
+Catalog initialization is allowed once per database. Creating a table allocates
+its heap root and appends its declaration to the catalog heap. Table names and
+IDs must be unique; there is no update, rename, alter, or drop path in the MVP.
+
+On open, North validates the catalog heap, every record and schema, duplicate
+names and IDs, and each referenced table-heap chain. The catalog can therefore
+be reopened read-only and still provide complete table metadata and scans.
+
 ## RID encoding
 
 An RID identifies a row without depending on a logical row number:
@@ -320,6 +367,8 @@ on-disk layout.
 | Module | Responsibility |
 | --- | --- |
 | `config` | Strict YAML configuration and validation |
+| `catalog` | Persistent immutable table registry and table-heap roots |
+| `heap::heap_file` | Linked slotted pages and record operations |
 | `schema::table` | Immutable schema validation and schema serialization |
 | `schema::row` | Compiled layouts and canonical row encoding/decoding |
 | `storage::buffer_pool` | Bounded page cache, guards, LRU eviction, and writeback |
